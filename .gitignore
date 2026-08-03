@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+data/
+
+# large / generated directories (any depth -- covers experiments/*/checkpoints,
+# cluster-codes/*/pretrained, etc. too)
+preliminary/
+figures/
+checkpoints/
+pretrained/
+
+# cluster job scripts -- contain personal info (usernames, paths, etc.)
+*.sh
+
+# generated plots (checkpoints/ already covers most, but stray root-level ones too)
+*.png
