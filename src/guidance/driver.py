@@ -28,12 +28,31 @@ def _clip_grad_norm(g, clip_norm, eps=1e-8):
     left unclipped this reliably diverges the sampler (verified empirically: a
     single spike at one guidance step sends x to NaN within a couple of
     subsequent steps). A soft cap preserves direction and small-gradient
-    behavior away from interfaces while preventing blowup."""
+    behavior away from interfaces while preventing blowup.
+
+    clip_norm may be a python scalar (fixed cap, broadcasts to every row) or
+    a per-row tensor of shape [B] or [B, 1] (e.g. an adaptive, x/t-dependent
+    cap from _resolve_clip_norm below) -- both divide elementwise into gn."""
     if clip_norm is None:
         return g
     gn = g.norm(dim=-1, keepdim=True).clamp(min=eps)
+    if torch.is_tensor(clip_norm):
+        clip_norm = clip_norm.reshape(gn.shape)
     scale = (clip_norm / gn).clamp(max=1.0)
     return g * scale
+
+
+def _resolve_clip_norm(grad_clip, z_t):
+    """grad_clip is either None, a fixed scalar, or a callable adaptive_clip_fn(z_t)
+    -> per-row cap [B] or [B, 1] -- e.g. ||score(z_t, t)|| at the current (x, t),
+    so the guidance correction is never allowed to outweigh the model's own drift
+    at that point rather than being bounded by one hand-picked constant for every
+    x and every t. Callable is evaluated under no_grad -- the cap itself is just a
+    magnitude, not something to backprop through."""
+    if not callable(grad_clip):
+        return grad_clip
+    with torch.no_grad():
+        return grad_clip(z_t)
 
 
 def gate_in_range(I, target_range):
@@ -52,6 +71,9 @@ def guidance_grad(y_fn, z_t, energy_fn, target_range=None, grad_clip=None):
     outside it (the algorithm's second gating condition); target_range=None
     applies guidance to every element whenever called (the caller still
     enforces the window/period gate).
+
+    grad_clip: None (no clipping), a fixed scalar, or a callable
+    adaptive_clip_fn(z_t) -> per-row cap [B]/[B, 1] -- see _resolve_clip_norm.
 
     This is the AMBIENT (no manifold information) baseline -- classic
     classifier-guidance-style exact gradient of I(D_t(z_t)) w.r.t. z_t. When
@@ -80,7 +102,7 @@ def guidance_grad(y_fn, z_t, energy_fn, target_range=None, grad_clip=None):
         grad = torch.zeros_like(z_t)
         if torch.any(in_range):
             (g_full,) = torch.autograd.grad(I.sum(), z_g)
-            g_full = _clip_grad_norm(g_full, grad_clip)
+            g_full = _clip_grad_norm(g_full, _resolve_clip_norm(grad_clip, z_t))
             mask = in_range.to(g_full.dtype).view(-1, *([1] * (g_full.dim() - 1)))
             grad = g_full * mask
     return grad, I.detach(), in_range
@@ -127,7 +149,7 @@ def projected_guidance_grad(y_fn, z_t, energy_fn, projector_fn, target_range=Non
         grad = torch.zeros_like(z_t)
         if torch.any(in_range):
             (g,) = torch.autograd.grad(I.sum(), y_leaf)
-            g = _clip_grad_norm(g, grad_clip)
+            g = _clip_grad_norm(g, _resolve_clip_norm(grad_clip, z_t))
             mask = in_range.to(g.dtype).view(-1, *([1] * (g.dim() - 1)))
             grad = g * mask
     return grad, I.detach(), in_range
