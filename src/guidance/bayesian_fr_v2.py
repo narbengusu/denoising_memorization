@@ -34,9 +34,16 @@ DEFAULT_ALPHA0 = 1.0
 DEFAULT_KAPPA = 1.0
 
 
-def posterior_mean_q_v2(y, neighbors, beta_t, alpha_0=None, kappa=None):
+def posterior_mean_q_v2(y, neighbors, beta_t, alpha_0=None, kappa=None, beta_floor=None):
     """y: [B, D], neighbors: [B, k, D] (the k retrieved training points, same
     as basic_fr.fisher_rao_energy). beta_t: [B], pinned to sigma_t^2.
+
+    beta_floor: see basic_fr.fisher_rao_energy's docstring -- q here is the
+    exact same plug-in softmax as basic_fr's own q, so it has the identical
+    vanishing-temperature pathology (saturates to an exact one-hot as
+    beta_t -> 0 late in sampling). When given, only this softmax uses
+    max(beta_t, beta_floor); q_bar's alpha_0/kappa shrinkage and a0 are
+    otherwise unaffected. None reproduces the original, undecoupled behavior.
 
     Returns (q_bar [B, k], g [B, k, D], a0 [B]) -- q_bar is the closed-form
     Dirichlet posterior mean over pi, g is the (unprojected) neighbor-
@@ -47,10 +54,11 @@ def posterior_mean_q_v2(y, neighbors, beta_t, alpha_0=None, kappa=None):
     kappa = DEFAULT_KAPPA if kappa is None else kappa
     k = neighbors.shape[1]
     beta_col = beta_t.view(-1, 1)
+    beta_soft_col = beta_col if beta_floor is None else beta_col.clamp(min=beta_floor)
 
     g = y.unsqueeze(1) - neighbors                        # [B, k, D]
     E = 0.5 * (g ** 2).sum(-1)                             # [B, k]
-    q = torch.softmax(-E / beta_col, dim=-1)               # [B, k], basic_fr's own plug-in q^beta(y)
+    q = torch.softmax(-E / beta_soft_col, dim=-1)          # [B, k], basic_fr's own plug-in q^beta(y)
 
     a0 = k * alpha_0 + kappa
     q_bar = (alpha_0 + kappa * q) / a0                     # [B, k]
@@ -58,7 +66,7 @@ def posterior_mean_q_v2(y, neighbors, beta_t, alpha_0=None, kappa=None):
     return q_bar, g, a0_vec
 
 
-def fisher_rao_energy_v2(y, neighbors, beta_t, alpha_0=None, kappa=None, P=None):
+def fisher_rao_energy_v2(y, neighbors, beta_t, alpha_0=None, kappa=None, P=None, beta_floor=None):
     """Closed-form Bayesian counterpart of basic_fr.fisher_rao_energy /
     bayesian_fr.fisher_rao_energy_bb: E(y) = a0/(a0+1) * I(q_bar), the exact
     posterior expectation of the plug-in Fisher-Rao energy under the
@@ -69,8 +77,10 @@ def fisher_rao_energy_v2(y, neighbors, beta_t, alpha_0=None, kappa=None, P=None)
     neighbor distances via posterior_mean_q_v2, matching bayesian_fr.py's own
     convention (its soft_posterior_bb also ignores P); P only restricts the
     variance-of-g term g itself, same contract as basic_fr.fisher_rao_energy.
+    beta_floor: see posterior_mean_q_v2 -- only affects q's own temperature;
+    the outer 1/beta_t^2 below always uses the true beta_t.
     Returns (E [B], q_bar [B, k], g [B, k, D])."""
-    q_bar, _, a0 = posterior_mean_q_v2(y, neighbors, beta_t, alpha_0, kappa)
+    q_bar, _, a0 = posterior_mean_q_v2(y, neighbors, beta_t, alpha_0, kappa, beta_floor=beta_floor)
 
     g = y.unsqueeze(1) - neighbors
     if P is not None:
@@ -82,26 +92,29 @@ def fisher_rao_energy_v2(y, neighbors, beta_t, alpha_0=None, kappa=None, P=None)
     return E, q_bar, g
 
 
-def make_knn_bayesian_v2_fr_energy_fn(index, k, beta_t_fn, alpha_0=None, kappa=None):
+def make_knn_bayesian_v2_fr_energy_fn(index, k, beta_t_fn, alpha_0=None, kappa=None, beta_floor=None):
     """Returns energy_fn(y) -> E [B] for driver.guidance_grad /
     guided_reverse_loop (the AMBIENT, unprojected energy) -- bayesianv2
     counterpart of basic_fr.make_knn_fr_energy_fn / bayesian_fr's bootstrap
-    factory."""
+    factory. beta_floor: see fisher_rao_energy_v2."""
     def energy_fn(y):
         with torch.no_grad():
             neighbors, _ = basic_fr.ann_query(index, y, k)
-        E, _, _ = fisher_rao_energy_v2(y, neighbors, beta_t_fn(), alpha_0=alpha_0, kappa=kappa)
+        E, _, _ = fisher_rao_energy_v2(y, neighbors, beta_t_fn(), alpha_0=alpha_0, kappa=kappa,
+                                        beta_floor=beta_floor)
         return E
     return energy_fn
 
 
-def make_knn_bayesian_v2_projected_energy_fn(index, k, beta_t_fn, alpha_0=None, kappa=None):
+def make_knn_bayesian_v2_projected_energy_fn(index, k, beta_t_fn, alpha_0=None, kappa=None, beta_floor=None):
     """Returns energy_fn(y, P) -> E [B] for
     driver.projected_guidance_grad/make_projected_guidance_fn -- the tangent-
-    restricted counterpart of make_knn_bayesian_v2_fr_energy_fn."""
+    restricted counterpart of make_knn_bayesian_v2_fr_energy_fn. beta_floor:
+    see fisher_rao_energy_v2."""
     def energy_fn(y, P):
         with torch.no_grad():
             neighbors, _ = basic_fr.ann_query(index, y, k)
-        E, _, _ = fisher_rao_energy_v2(y, neighbors, beta_t_fn(), alpha_0=alpha_0, kappa=kappa, P=P)
+        E, _, _ = fisher_rao_energy_v2(y, neighbors, beta_t_fn(), alpha_0=alpha_0, kappa=kappa, P=P,
+                                        beta_floor=beta_floor)
         return E
     return energy_fn

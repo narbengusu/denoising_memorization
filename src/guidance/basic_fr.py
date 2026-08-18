@@ -35,7 +35,7 @@ def ann_query(index, y, k, chunk_size=20_000):
     return index[best_i], best_d
 
 
-def fisher_rao_energy(y, neighbors, beta_t, P=None):
+def fisher_rao_energy(y, neighbors, beta_t, P=None, beta_floor=None):
     """y: [B, D], neighbors: [B, k, D] (the k retrieved training points).
     beta_t: [B] -- NOT a free hyperparameter; the algorithm's Require line
     lists only the noise schedule sigma_t (beta_t never appears there
@@ -57,43 +57,63 @@ def fisher_rao_energy(y, neighbors, beta_t, P=None):
     score-divergence's flat trace correction, this is a plain sum of squares
     that already shrinks with the projected rank.
 
+    beta_t plays two different roles here: the softmax TEMPERATURE (how
+    sharply q concentrates on the nearest neighbor) and the OUTER SCALE
+    (1/beta_t^2, which is what should blow up near Laguerre-cell boundaries
+    as sigma_t -> 0 -- verified empirically to matter for guidance quality
+    late in sampling). Forcing both to the same vanishing beta_t makes q
+    saturate to an exact one-hot (verified in float64, not a float32
+    precision artifact) well before sigma_t reaches 0, at which point
+    Var_q(g) -- and its gradient -- is EXACTLY zero: a genuine dead zone
+    (measured to cover 45-90%+ of a toy 2D ambient grid late in sampling),
+    not just "small". beta_floor decouples the two roles: if given, the
+    softmax uses max(beta_t, beta_floor) as its temperature (keeping q from
+    ever fully collapsing, so the gradient stays informative), while the
+    outer 1/beta_t^2 division still uses the TRUE, unfloored beta_t, so the
+    boundary blow-up behavior late in sampling is preserved exactly.
+    beta_floor=None (default) reproduces the original, undecoupled behavior.
+
     E_ij = 1/2||g_ij||^2 (+ beta_t * log N, a constant across all candidates
     that cancels in the softmax below, so it is omitted). Returns (I [B], q
     [B, k], g [B, k, D])."""
     beta_col = beta_t.view(-1, 1)
+    beta_soft_col = beta_col if beta_floor is None else beta_col.clamp(min=beta_floor)
     g = y.unsqueeze(1) - neighbors
     if P is not None:
         g = apply_projector(P, g)
     E = 0.5 * (g ** 2).sum(-1)
-    q = torch.softmax(-E / beta_col, dim=-1)
+    q = torch.softmax(-E / beta_soft_col, dim=-1)
     Eq_g = (q.unsqueeze(-1) * g).sum(1)
     Eq_g2 = (q * (g ** 2).sum(-1)).sum(1)
     I = (Eq_g2 - (Eq_g ** 2).sum(-1)) / beta_t ** 2
     return I, q, g
 
 
-def make_knn_fr_energy_fn(index, k, beta_t_fn):
+def make_knn_fr_energy_fn(index, k, beta_t_fn, beta_floor=None):
     """Returns energy_fn(y) -> I [B] for driver.guidance_grad /
     guided_reverse_loop (the AMBIENT, unprojected energy). beta_t_fn() -> [B]
     must return sigma_t^2 at the CURRENT diffusion step -- typically a
     closure reading a mutable t_vec set once per step, same pattern as the
-    y_fn.t_vec trick used for the denoiser in the sample scripts."""
+    y_fn.t_vec trick used for the denoiser in the sample scripts. beta_floor:
+    see fisher_rao_energy -- decouples the softmax temperature from the
+    (unfloored) outer 1/beta_t^2 scale; None reproduces the original
+    behavior."""
     def energy_fn(y):
         with torch.no_grad():
             neighbors, _ = ann_query(index, y, k)
-        I, _, _ = fisher_rao_energy(y, neighbors, beta_t_fn())
+        I, _, _ = fisher_rao_energy(y, neighbors, beta_t_fn(), beta_floor=beta_floor)
         return I
     return energy_fn
 
 
-def make_knn_projected_energy_fn(index, k, beta_t_fn):
+def make_knn_projected_energy_fn(index, k, beta_t_fn, beta_floor=None):
     """Returns energy_fn(y, P) -> I [B] for
     driver.projected_guidance_grad/make_projected_guidance_fn -- the tangent-
-    restricted counterpart of make_knn_fr_energy_fn. beta_t_fn() same as
-    above."""
+    restricted counterpart of make_knn_fr_energy_fn. beta_t_fn(), beta_floor
+    same as above."""
     def energy_fn(y, P):
         with torch.no_grad():
             neighbors, _ = ann_query(index, y, k)
-        I, _, _ = fisher_rao_energy(y, neighbors, beta_t_fn(), P)
+        I, _, _ = fisher_rao_energy(y, neighbors, beta_t_fn(), P, beta_floor=beta_floor)
         return I
     return energy_fn

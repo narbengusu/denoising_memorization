@@ -118,48 +118,69 @@ def make_autograd_guidance_fn(y_fn, energy_fn, target_range=None, grad_clip=None
     return guidance_fn
 
 
-def projected_guidance_grad(y_fn, z_t, energy_fn, projector_fn, target_range=None, grad_clip=None):
-    """Compute the tangent-projected guidance correction directly in y-space:
-    Jacobian(y) * grad_y I(y, P), NOT grad_z I(D_t(z_t)) reprojected after the
-    fact. energy_fn(y, P) -> I [B] must itself use P to restrict the energy
-    to tangent directions (e.g. basic_fr.make_knn_projected_energy_fn,
-    score_divergence.make_score_div_projected_energy_fn) -- both the energy
-    and its gradient are then tangent-restricted by construction, so there is
-    no incoherent reprojection of an ambient gradient that passed through the
-    denoiser's own unrelated Jacobian.
+def projected_guidance_grad(y_fn, z_t, energy_fn, projector_fn, target_range=None, grad_clip=None,
+                             denoiser_jacobian_fn=None):
+    """Compute the tangent-projected guidance correction. `P` is built from a
+    detached snapshot of `y` (the tangent DIRECTIONS should reflect the
+    manifold/energy geometry at y, not get perturbed by whatever Jacobian
+    machinery is used elsewhere) -- energy_fn(y, P) -> I [B] must itself use
+    P to restrict the energy to tangent directions (e.g.
+    basic_fr.make_knn_projected_energy_fn, score_divergence.make_score_div_projected_energy_fn).
 
-    y_fn is evaluated under no_grad and re-wrapped as its own leaf: no
-    backward pass through the denoiser is built at all here, only through
-    energy_fn -- for basic_fr this means guidance needs no backprop through
-    the score network whatsoever.
+    denoiser_jacobian_fn=None (default): grad_y I(y, P) is computed in
+    y-space and used AS-IS as the z_t-space correction -- implicitly assumes
+    dy/dz_t = identity. Cheap (no Jacobian of any kind needed). But verified
+    empirically (toy_manifold debugging session) that the denoiser is
+    strongly non-identity at high t, and this default can point the
+    correction in the WRONG direction for the majority of samples during the
+    noisiest ~20% of a reverse trajectory (median cosine similarity to the
+    true grad_z_t I(D_t(z_t), P) was negative there) despite having a
+    plausible-looking magnitude.
 
-    grad_clip is applied AFTER projection (the correction is already
-    tangential by this point, so the clip bounds that directly, rather than
-    bounding an ambient vector that then gets shrunk again by projection).
+    denoiser_jacobian_fn(z_t) -> J [B, D, D] (dy/dz_t, exact or a cheap
+    approximation -- e.g. jacrev/vmap over y_fn at toy/SO(n) scale where D is
+    small, or a dedicated small network at image/molecule scale where a full
+    backward pass through the real denoiser would be the expensive
+    alternative): when given, the returned gradient is J^T @ grad_y I(y, P),
+    the correctly Jacobian-mapped z_t-space correction -- mathematically
+    equivalent to backprop-ing all the way through the denoiser, but without
+    ever running its (possibly large) backward pass, since J is supplied
+    directly. This is what should actually be used; None only exists so
+    callers that haven't wired up a jacobian_fn yet keep their old behavior.
+
+    grad_clip is applied to the FINAL z_t-space correction (after the
+    Jacobian mapping, if any) -- the clip should bound what actually gets
+    added to z_t, not an intermediate y-space quantity.
 
     Returns (grad [same shape as z_t], I.detach() [B], in_range [B] bool)."""
     with torch.no_grad():
-        y = y_fn(z_t)
-    P = projector_fn(y)
+        y_snapshot = y_fn(z_t)
+    P = projector_fn(y_snapshot)
     with torch.enable_grad():
-        y_leaf = y.detach().requires_grad_(True)
+        y_leaf = y_snapshot.detach().requires_grad_(True)
         I = energy_fn(y_leaf, P)
         in_range = gate_in_range(I, target_range)
 
         grad = torch.zeros_like(z_t)
         if torch.any(in_range):
             (g,) = torch.autograd.grad(I.sum(), y_leaf)
+            if denoiser_jacobian_fn is not None:
+                with torch.no_grad():
+                    J = denoiser_jacobian_fn(z_t)   # [B, D, D], dy/dz_t
+                g = torch.bmm(J.transpose(-1, -2), g.unsqueeze(-1)).squeeze(-1)
             g = _clip_grad_norm(g, _resolve_clip_norm(grad_clip, z_t))
             mask = in_range.to(g.dtype).view(-1, *([1] * (g.dim() - 1)))
             grad = g * mask
     return grad, I.detach(), in_range
 
 
-def make_projected_guidance_fn(y_fn, energy_fn, projector_fn, target_range=None, grad_clip=None):
+def make_projected_guidance_fn(y_fn, energy_fn, projector_fn, target_range=None, grad_clip=None,
+                                denoiser_jacobian_fn=None):
     """Adapter: wraps projected_guidance_grad into the guidance_fn(z_t) ->
     (grad, I, in_range) signature guided_reverse_loop expects."""
     def guidance_fn(z_t):
-        return projected_guidance_grad(y_fn, z_t, energy_fn, projector_fn, target_range, grad_clip)
+        return projected_guidance_grad(y_fn, z_t, energy_fn, projector_fn, target_range, grad_clip,
+                                        denoiser_jacobian_fn)
     return guidance_fn
 
 

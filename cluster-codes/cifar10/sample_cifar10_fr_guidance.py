@@ -19,8 +19,16 @@ would be far too slow to compute per grid cell. Run assess_memorization_cifar10.
 
 SCALE WARNING: sample_cifar10_fr.py's existing single-method grid (30 combos, 500
 samples/1000 steps) already needs ~8h wall time. This script's default grid is deliberately
-much smaller (2 windows x 2 grad_clips x 3 lams, 100 samples/250 steps) since it also sweeps
+much smaller (2 windows x 3 grad_clips x 3 lams, 100 samples/250 steps) since it also sweeps
 method x jacobian x r' on top -- widen via the env vars below once you've narrowed things down.
+
+GRAD_CLIP_LIST entries are either a plain number (fixed cap, e.g. "10") or "adaptive:<scale>"
+(e.g. "adaptive:1.0"), mixed freely in the same list -- see resolve_clip_spec /
+make_adaptive_clip_fn below. Adaptive caps the guidance correction at scale * ||s_theta(z_t,
+t)||, the model's own ambient score norm at the CURRENT (noisy) z_t, not the denoised y --
+driver.py's _resolve_clip_norm docstring's proposed use case for its callable-grad_clip path,
+here actually wired up for the first time (previously only a mechanism, unused by any script
+or notebook).
 """
 import os
 import time
@@ -59,7 +67,7 @@ SAMPLE_SEED = int(os.environ.get("SAMPLE_SEED", 1))
 # kept as raw strings so the filename/row tag is built from the exact token the .sh script's
 # bash loop also sees -- see the identical comment in sample_cifar10_fr.py.
 LAMBDA_LIST = [s.strip() for s in os.environ.get("LAMBDA_LIST", "1,10,50").split(",")]
-GRAD_CLIP_LIST = [s.strip() for s in os.environ.get("GRAD_CLIP_LIST", "10,100").split(",")]
+GRAD_CLIP_LIST = [s.strip() for s in os.environ.get("GRAD_CLIP_LIST", "10,100,adaptive:1.0").split(",")]
 WINDOW_LIST = [s.strip() for s in os.environ.get("WINDOW_LIST", "0.3-1.0,0.6-1.0").split(",")]
 R_PRIME_LIST = [int(s.strip()) for s in os.environ.get("R_PRIME_LIST", "1,2,3,5").split(",")]
 
@@ -195,6 +203,16 @@ def make_wiring(n_steps, generator=None):
         sigma_t = (1 - alphas_cumprod[y_fn.t]).sqrt()
         return pack(-eps_hat / sigma_t)
 
+    def score_at_zt_fn(z_t):
+        # Same s_theta = -eps_theta/sigma_t as score_fn, but evaluated at the current NOISY
+        # z_t rather than the denoised y -- the adaptive-clip cap's job is to bound the
+        # guidance correction relative to the model's own drift at the point actually being
+        # stepped, so it needs the score there, not at a would-be clean estimate.
+        x_t = unpack(z_t)
+        eps_hat = net(x_t, y_fn.t).sample
+        sigma_t = (1 - alphas_cumprod[y_fn.t]).sqrt()
+        return pack(-eps_hat / sigma_t)
+
     def sigma2_fn():
         return (1 - alphas_cumprod[y_fn.t]).expand(config["n_samples"])
 
@@ -205,7 +223,8 @@ def make_wiring(n_steps, generator=None):
         t_frac = (y_fn.t.float() / (num_train_timesteps - 1)).expand(y.shape[0])
         return jac_net(y, t_frac)
 
-    return timesteps, alphas_cumprod, y_fn, base_step_with_t, step_scale_fn, score_fn, sigma2_fn, d_fn, u_fn
+    return (timesteps, alphas_cumprod, y_fn, base_step_with_t, step_scale_fn,
+            score_fn, score_at_zt_fn, sigma2_fn, d_fn, u_fn)
 
 
 # ---------------------------------------------------------------------------
@@ -248,12 +267,14 @@ def make_energy_factories(y_fn, score_fn, sigma2_fn, d_fn):
 # ---------------------------------------------------------------------------
 def run_diagnostic():
     (timesteps, alphas_cumprod, y_fn, base_step_with_t, step_scale_fn,
-     score_fn, sigma2_fn, d_fn, u_fn) = make_wiring(DIAG_N_STEPS)
+     score_fn, score_at_zt_fn, sigma2_fn, d_fn, u_fn) = make_wiring(DIAG_N_STEPS)
     ENERGY_FACTORIES, make_knn_proj, make_scorediv_proj = make_energy_factories(y_fn, score_fn, sigma2_fn, d_fn)
 
     diag_r_prime = max(R_PRIME_LIST)
     diag_projector_fn = driver.make_lowrank_normal_projector_fn(u_fn, diag_r_prime)
-    diag_energy_fns = {"basic_fr": ENERGY_FACTORIES["basic_fr"](), "score_divergence": ENERGY_FACTORIES["score_divergence"]()}
+    # score_divergence's ambient/exact-autograd path is excluded from the main sweep (OOM risk,
+    # see main()) -- skip it here too rather than exercise a path we never actually sample with.
+    diag_energy_fns = {"basic_fr": ENERGY_FACTORIES["basic_fr"]()}
     diag_projected_energy_fns = {"basic_fr": make_knn_proj(), "score_divergence": make_scorediv_proj(diag_r_prime)}
 
     torch.manual_seed(config["seed"])
@@ -310,6 +331,29 @@ def evaluate(x_gen_flat):
 
 
 # ---------------------------------------------------------------------------
+# Adaptive clip: cap the guidance correction at scale * ||s_theta(z_t, t)||, a per-sample,
+# per-t cap that tracks the model's own drift magnitude, rather than one fixed constant for
+# every (x, t) -- driver._resolve_clip_norm already accepts a callable adaptive_clip_fn(z_t),
+# this is the first place actually supplying one.
+# ---------------------------------------------------------------------------
+def make_adaptive_clip_fn(score_at_zt_fn, scale):
+    def adaptive_clip_fn(z_t):
+        return scale * score_at_zt_fn(z_t).norm(dim=-1)
+    return adaptive_clip_fn
+
+
+def resolve_clip_spec(clip_str, score_at_zt_fn):
+    """clip_str is either a plain number ("10") or "adaptive:<scale>" ("adaptive:1.0").
+    Returns (grad_clip, is_adaptive) -- grad_clip is a float for the former, a callable
+    adaptive_clip_fn(z_t) for the latter (both accepted transparently by
+    driver._resolve_clip_norm)."""
+    if clip_str.startswith("adaptive:"):
+        scale = float(clip_str.split(":", 1)[1])
+        return make_adaptive_clip_fn(score_at_zt_fn, scale), True
+    return float(clip_str), False
+
+
+# ---------------------------------------------------------------------------
 # Full sweep: method x jacobian x r' x window x grad_clip x lam
 # ---------------------------------------------------------------------------
 def make_guidance_fn(y_fn, ENERGY_FACTORIES, make_knn_proj, make_scorediv_proj, u_fn,
@@ -357,29 +401,38 @@ def main():
     n_steps = config["n_steps_eval"]
     gen = torch.Generator(device=config["device"]).manual_seed(SAMPLE_SEED)
     (timesteps, alphas_cumprod, y_fn, base_step_with_t, step_scale_fn,
-     score_fn, sigma2_fn, d_fn, u_fn) = make_wiring(n_steps, generator=gen)
+     score_fn, score_at_zt_fn, sigma2_fn, d_fn, u_fn) = make_wiring(n_steps, generator=gen)
     ENERGY_FACTORIES, make_knn_proj, make_scorediv_proj = make_energy_factories(y_fn, score_fn, sigma2_fn, d_fn)
 
     print(f"unguided baseline ({config['n_samples']} samples, {n_steps} steps)...", flush=True)
     X_unguided = run_condition(base_step_with_t, n_steps, None, 0.0, 0.0, 1.0, step_scale_fn, gen)
     baseline = {"method": "unguided", "jacobian": "none", "r_prime": "n/a", "window": "n/a",
-                "grad_clip": 0.0, "lam": 0.0, **evaluate(pack(X_unguided))}
+                "grad_clip": "n/a", "clip_mode": "n/a", "lam": 0.0, **evaluate(pack(X_unguided))}
     print(baseline, flush=True)
 
     rows = [baseline]
-    JACOBIAN_NAMES = ["none", "jacnet"]
-    n_combos = (len(GRAD_CLIP_LIST) * len(WINDOW_LIST) * len(LAMBDA_LIST)
-                * len(ENERGY_FACTORIES) * (1 + len(R_PRIME_LIST)))
-    print(f"sweeping ~{n_combos} combos (method x jacobian x r' x window x grad_clip x lam)", flush=True)
+    # score_divergence is JacNet-projected ONLY -- jacobian="none" there means either exact
+    # autograd double-backward through the whole UNet (the verified-OOM path, see
+    # score_divergence.py's module docstring) or the FD/SPSA path, which is cheap but was
+    # explicitly ruled out as a combo we want in this sweep: only the projected condition is
+    # of interest here, so skip ambient score_divergence entirely rather than spend combos on
+    # a path we won't use. basic_fr's ambient path has no such cost (no backprop through the
+    # denoiser at all -- it's a k-NN energy), so it still sweeps both.
+    JACOBIAN_NAMES_BY_METHOD = {"basic_fr": ["none", "jacnet"], "score_divergence": ["jacnet"]}
+    # basic_fr: 1 (ambient) + R' (jacnet) jacobian-conditions; score_divergence: R' (jacnet) only.
+    n_jacobian_conditions = (1 + len(R_PRIME_LIST)) + len(R_PRIME_LIST)
+    n_combos = len(GRAD_CLIP_LIST) * len(WINDOW_LIST) * len(LAMBDA_LIST) * n_jacobian_conditions
+    print(f"sweeping ~{n_combos} combos (method x jacobian x r' x window x grad_clip x lam; "
+          f"score_divergence restricted to jacobian=jacnet only)", flush=True)
 
     for method in ENERGY_FACTORIES:
-        for jacobian_name in JACOBIAN_NAMES:
+        for jacobian_name in JACOBIAN_NAMES_BY_METHOD[method]:
             r_primes = ["n/a"] if jacobian_name == "none" else R_PRIME_LIST
             for r_prime in r_primes:
                 for window_str in WINDOW_LIST:
                     progress_lo, progress_hi = (float(v) for v in window_str.split("-"))
                     for clip_str in GRAD_CLIP_LIST:
-                        grad_clip = float(clip_str)
+                        grad_clip, is_adaptive = resolve_clip_spec(clip_str, score_at_zt_fn)
                         guidance_fn = make_guidance_fn(
                             y_fn, ENERGY_FACTORIES, make_knn_proj, make_scorediv_proj, u_fn,
                             score_fn, sigma2_fn, d_fn, method, jacobian_name,
@@ -390,10 +443,12 @@ def main():
                             X = run_condition(base_step_with_t, n_steps, guidance_fn,
                                                lam, progress_lo, progress_hi, step_scale_fn, gen)
                             row = {"method": method, "jacobian": jacobian_name, "r_prime": r_prime,
-                                   "window": window_str, "grad_clip": grad_clip, "lam": lam,
+                                   "window": window_str, "grad_clip": clip_str,
+                                   "clip_mode": "adaptive" if is_adaptive else "fixed", "lam": lam,
                                    **evaluate(pack(X))}
                             rows.append(row)
-                            tag = f"{method}_{jacobian_name}_r{r_prime}_win{window_str}_clip{clip_str}_lam{lam_str}"
+                            clip_tag = clip_str.replace(":", "")
+                            tag = f"{method}_{jacobian_name}_r{r_prime}_win{window_str}_clip{clip_tag}_lam{lam_str}"
                             print(f"{tag}: {row['mem_ratio']=:.3f} {row['fidelity_proxy']=:.4f} "
                                   f"({time.time() - t0:.1f}s)", flush=True)
 
@@ -412,7 +467,7 @@ def main():
 
     # Per-parameter marginals (window, grad_clip, lam, r') -- same median (robustness) / min
     # (best-case) breakdown as the toy/SO(3) notebooks.
-    PARAM_COLS = {"window": WINDOW_LIST, "grad_clip": [float(c) for c in GRAD_CLIP_LIST], "lam": [float(l) for l in LAMBDA_LIST]}
+    PARAM_COLS = {"window": WINDOW_LIST, "grad_clip": GRAD_CLIP_LIST, "lam": [float(l) for l in LAMBDA_LIST]}
     for param_col, values in PARAM_COLS.items():
         stats = guided.groupby(["method", "jacobian", param_col])["combined_error"].agg(["median", "min"]).reset_index()
         best_median = stats.loc[stats.groupby(["method", "jacobian"])["median"].idxmin()]
@@ -425,9 +480,11 @@ def main():
     print("\n-- r_prime -- (jacnet only) best by median:", flush=True)
     print(r_best_median.sort_values("method").to_string(index=False), flush=True)
 
+    # score_divergence is jacobian="jacnet"-only in this sweep (see the jacobian-conditions
+    # comment above main()'s loop), so there is no ("score_divergence", "none") group to plot.
     GROUP_COLORS = {
         ("basic_fr", "none"): "tab:blue", ("basic_fr", "jacnet"): "tab:green",
-        ("score_divergence", "none"): "tab:orange", ("score_divergence", "jacnet"): "tab:red",
+        ("score_divergence", "jacnet"): "tab:red",
     }
     GROUPS = list(GROUP_COLORS.keys())
     JACNET_GROUPS = [g for g in GROUPS if g[1] == "jacnet"]
