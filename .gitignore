@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 data/
+CLAUDE.md
 
 # large / generated directories (any depth -- covers experiments/*/checkpoints,
 # cluster-codes/*/pretrained, etc. too)
@@ -10,6 +11,7 @@ preliminary/
 figures/
 checkpoints/
 pretrained/
+trained_data/
 
 # cluster job scripts -- contain personal info (usernames, paths, etc.)
 *.sh

@@ -1,7 +1,7 @@
-"""Unified FR-guidance pipeline for the finetuned CIFAR-10 DDPM -- same narrative as
-experiments/toy_manifold/02_fr_guidance.ipynb / experiments/so_n/03_fr_guidance.ipynb (both
-guidance energies, unprojected + tangent-projected, a gradient-norm diagnostic, a full
-method x jacobian x r' x window x grad_clip x lam sweep, per-parameter marginals), adapted to
+"""FR-guidance pipeline for the finetuned CIFAR-10 DDPM -- same narrative as
+experiments/toy_manifold/02_fr_guidance.ipynb / experiments/so_n/03_fr_guidance.ipynb (the
+k-NN Fisher-Rao energy, unprojected + tangent-projected, a gradient-norm diagnostic, a full
+jacobian x r' x window x grad_clip x lam sweep, per-parameter marginals), adapted to
 a headless script (prints + savefig, no inline display) and to this project's low-rank JacNet
 (train_cifar10_jacnet.py) rather than a dense one.
 
@@ -44,7 +44,7 @@ from diffusers import UNet2DModel, DDPMScheduler
 
 from cifar10_data import load_cifar10
 from assess_memorization_cifar10 import nearest_neighbor_d1_d2, classify_images
-from guidance import driver, basic_fr, score_divergence
+from guidance import driver, basic_fr
 
 config = {
     "device": os.environ.get("DEVICE", "cpu"),
@@ -53,7 +53,6 @@ config = {
     "n_samples": int(os.environ.get("N_SAMPLES", 100)),
     "n_steps_eval": int(os.environ.get("N_STEPS_EVAL", 250)),
     "k_neighbors": int(os.environ.get("K_NN", 5)),
-    "r_probes": int(os.environ.get("R_PROBES", 4)),
     "ell": int(os.environ.get("ELL", 1)),
     "mem_ratio_threshold": float(os.environ.get("MEM_RATIO_THRESHOLD", 1 / 3)),
     "n_heldout": int(os.environ.get("N_HELDOUT", 500)),
@@ -74,10 +73,6 @@ R_PRIME_LIST = [int(s.strip()) for s in os.environ.get("R_PRIME_LIST", "1,2,3,5"
 IOTA_MIN = os.environ.get("IOTA_MIN")
 IOTA_MAX = os.environ.get("IOTA_MAX")
 TARGET_RANGE = (float(IOTA_MIN), float(IOTA_MAX)) if IOTA_MIN is not None and IOTA_MAX is not None else None
-
-GUIDANCE_GRAD_MODE = os.environ.get("GUIDANCE_GRAD_MODE", "fd")   # ambient score_divergence only, see module docstring
-N_DIRS = int(os.environ.get("N_DIRS", 4))
-FD_EPS = float(os.environ.get("FD_EPS", 1e-2))
 
 DIAG_N_STEPS = int(os.environ.get("DIAG_N_STEPS", 100))   # separate, cheaper schedule for the diagnostic panel
 DIAG_STRIDE = int(os.environ.get("DIAG_STRIDE", 5))       # only compute the guidance grad every this-many diag steps
@@ -197,17 +192,11 @@ def make_wiring(n_steps, generator=None):
         # sample_cifar10_fr.py's step_scale_fn for why the override is required.
         return scheduler._get_variance(t, variance_type="fixed_small")
 
-    def score_fn(y):
-        x_y = unpack(y)
-        eps_hat = net(x_y, y_fn.t).sample
-        sigma_t = (1 - alphas_cumprod[y_fn.t]).sqrt()
-        return pack(-eps_hat / sigma_t)
-
     def score_at_zt_fn(z_t):
-        # Same s_theta = -eps_theta/sigma_t as score_fn, but evaluated at the current NOISY
-        # z_t rather than the denoised y -- the adaptive-clip cap's job is to bound the
-        # guidance correction relative to the model's own drift at the point actually being
-        # stepped, so it needs the score there, not at a would-be clean estimate.
+        # s_theta = -eps_theta/sigma_t evaluated at the current NOISY z_t rather than the
+        # denoised y -- the adaptive-clip cap's job is to bound the guidance correction
+        # relative to the model's own drift at the point actually being stepped, so it needs
+        # the score there, not at a would-be clean estimate.
         x_t = unpack(z_t)
         eps_hat = net(x_t, y_fn.t).sample
         sigma_t = (1 - alphas_cumprod[y_fn.t]).sqrt()
@@ -216,22 +205,19 @@ def make_wiring(n_steps, generator=None):
     def sigma2_fn():
         return (1 - alphas_cumprod[y_fn.t]).expand(config["n_samples"])
 
-    def d_fn():
-        return torch.full((config["n_samples"],), float(D_FLAT), device=config["device"])
-
     def u_fn(y):
         t_frac = (y_fn.t.float() / (num_train_timesteps - 1)).expand(y.shape[0])
         return jac_net(y, t_frac)
 
     return (timesteps, alphas_cumprod, y_fn, base_step_with_t, step_scale_fn,
-            score_fn, score_at_zt_fn, sigma2_fn, d_fn, u_fn)
+            score_at_zt_fn, sigma2_fn, u_fn)
 
 
 # ---------------------------------------------------------------------------
-# Guidance energies -- ambient + projected, both methods (same shape as the
-# ENERGY_FACTORIES / PROJECTED_ENERGY_FACTORIES split in the SO(3)/toy notebooks).
+# Guidance energies -- ambient + projected (same shape as the ENERGY_FACTORIES /
+# PROJECTED_ENERGY_FACTORIES split in the SO(3)/toy notebooks).
 # ---------------------------------------------------------------------------
-def make_energy_factories(y_fn, score_fn, sigma2_fn, d_fn):
+def make_energy_factories(y_fn, sigma2_fn):
     def make_knn_energy_fn():
         def energy_fn(y):
             with torch.no_grad():
@@ -240,42 +226,28 @@ def make_energy_factories(y_fn, score_fn, sigma2_fn, d_fn):
             return I
         return energy_fn
 
-    def make_score_divergence_energy_fn():
-        return score_divergence.make_score_div_energy_fn(score_fn, sigma2_fn, d_fn, r=config["r_probes"])
-
     def make_knn_projected_energy_fn():
         return basic_fr.make_knn_projected_energy_fn(train_index, config["k_neighbors"], sigma2_fn)
 
-    def make_score_divergence_projected_energy_fn(r_prime):
-        # k_fn = D_FLAT - r_prime, NOT r_prime: the projector here KEEPS the (D_FLAT - r_prime)-
-        # dim orthogonal complement (it's an "remove the top-r' normal directions" projector,
-        # the inverse framing from the toy/SO(3) notebooks' "keep the top-k tangent directions"
-        # dense projector) -- the flat-Gaussian correction term must match whatever subspace
-        # dimension the trace is actually restricted to.
-        return score_divergence.make_score_div_projected_energy_fn(
-            score_fn, sigma2_fn, k_fn=lambda: D_FLAT - r_prime, r=config["r_probes"])
-
-    ENERGY_FACTORIES = {"basic_fr": make_knn_energy_fn, "score_divergence": make_score_divergence_energy_fn}
-    return ENERGY_FACTORIES, make_knn_projected_energy_fn, make_score_divergence_projected_energy_fn
+    ENERGY_FACTORIES = {"basic_fr": make_knn_energy_fn}
+    return ENERGY_FACTORIES, make_knn_projected_energy_fn
 
 
 # ---------------------------------------------------------------------------
-# Diagnostic: unclipped guidance gradient norm vs t, unprojected vs. projected (r'=max(R_PRIME_LIST)),
-# both energies -- same dual-panel/color convention as the notebooks. Uses its OWN, much
-# smaller step schedule (DIAG_N_STEPS) than the main sweep -- this walks the whole trajectory
-# under no_grad but computes the (expensive) guidance gradient only every DIAG_STRIDE-th step.
+# Diagnostic: unclipped guidance gradient norm vs t, unprojected vs. projected (r'=max(R_PRIME_LIST)) --
+# same dual-panel/color convention as the notebooks. Uses its OWN, much smaller step schedule
+# (DIAG_N_STEPS) than the main sweep -- this walks the whole trajectory under no_grad but computes
+# the (expensive) guidance gradient only every DIAG_STRIDE-th step.
 # ---------------------------------------------------------------------------
 def run_diagnostic():
     (timesteps, alphas_cumprod, y_fn, base_step_with_t, step_scale_fn,
-     score_fn, score_at_zt_fn, sigma2_fn, d_fn, u_fn) = make_wiring(DIAG_N_STEPS)
-    ENERGY_FACTORIES, make_knn_proj, make_scorediv_proj = make_energy_factories(y_fn, score_fn, sigma2_fn, d_fn)
+     score_at_zt_fn, sigma2_fn, u_fn) = make_wiring(DIAG_N_STEPS)
+    ENERGY_FACTORIES, make_knn_proj = make_energy_factories(y_fn, sigma2_fn)
 
     diag_r_prime = max(R_PRIME_LIST)
     diag_projector_fn = driver.make_lowrank_normal_projector_fn(u_fn, diag_r_prime)
-    # score_divergence's ambient/exact-autograd path is excluded from the main sweep (OOM risk,
-    # see main()) -- skip it here too rather than exercise a path we never actually sample with.
     diag_energy_fns = {"basic_fr": ENERGY_FACTORIES["basic_fr"]()}
-    diag_projected_energy_fns = {"basic_fr": make_knn_proj(), "score_divergence": make_scorediv_proj(diag_r_prime)}
+    diag_projected_energy_fns = {"basic_fr": make_knn_proj()}
 
     torch.manual_seed(config["seed"])
     z = pack(torch.randn(config["n_samples"], 3, 32, 32, device=config["device"]))
@@ -287,12 +259,12 @@ def run_diagnostic():
             t_val = timesteps[step_idx - 1].item()
             sigma2_val = (1 - alphas_cumprod[timesteps[step_idx - 1]]).item()
             for name, energy_fn in diag_energy_fns.items():
-                grad, _, _ = driver.guidance_grad(y_fn, z, energy_fn, target_range=None, grad_clip=None)
+                grad, *_ = driver.guidance_grad(y_fn, z, energy_fn, target_range=None, grad_clip=None)
                 gnorm = grad.norm(dim=-1)
                 rows.append({"step_idx": step_idx, "t": t_val, "sigma2": sigma2_val, "method": name,
                              "projected": False, "grad_norm_mean": gnorm.mean().item()})
             for name, energy_fn in diag_projected_energy_fns.items():
-                grad, _, _ = driver.projected_guidance_grad(y_fn, z, energy_fn, diag_projector_fn,
+                grad, *_ = driver.projected_guidance_grad(y_fn, z, energy_fn, diag_projector_fn,
                                                               target_range=None, grad_clip=None)
                 gnorm = grad.norm(dim=-1)
                 rows.append({"step_idx": step_idx, "t": t_val, "sigma2": sigma2_val, "method": name,
@@ -300,8 +272,8 @@ def run_diagnostic():
         z = z_next
 
     diag_df = pd.DataFrame(rows)
-    UNPROJ_COLORS = {"basic_fr": "tab:blue", "score_divergence": "tab:orange"}
-    PROJ_COLORS = {"basic_fr": "tab:green", "score_divergence": "tab:red"}
+    UNPROJ_COLORS = {"basic_fr": "tab:blue"}
+    PROJ_COLORS = {"basic_fr": "tab:green"}
 
     fig, axes = plt.subplots(1, 2, figsize=(13, 4), sharex=True, sharey=True)
     for name, sub in diag_df[~diag_df["projected"]].groupby("method"):
@@ -354,26 +326,15 @@ def resolve_clip_spec(clip_str, score_at_zt_fn):
 
 
 # ---------------------------------------------------------------------------
-# Full sweep: method x jacobian x r' x window x grad_clip x lam
+# Full sweep: jacobian x r' x window x grad_clip x lam
 # ---------------------------------------------------------------------------
-def make_guidance_fn(y_fn, ENERGY_FACTORIES, make_knn_proj, make_scorediv_proj, u_fn,
-                      score_fn, sigma2_fn, d_fn, method, jacobian_name, r_prime, grad_clip):
+def make_guidance_fn(y_fn, ENERGY_FACTORIES, make_knn_proj, u_fn, jacobian_name, r_prime, grad_clip):
     if jacobian_name == "none":
-        if method == "basic_fr":
-            energy_fn = ENERGY_FACTORIES["basic_fr"]()
-            return driver.make_autograd_guidance_fn(y_fn, energy_fn, target_range=TARGET_RANGE, grad_clip=grad_clip)
-        if GUIDANCE_GRAD_MODE == "fd":
-            return score_divergence.make_score_div_fd_guidance_fn(
-                y_fn, score_fn, sigma2_fn, d_fn, config["r_probes"],
-                n_dirs=N_DIRS, eps=FD_EPS, target_range=TARGET_RANGE, grad_clip=grad_clip)
-        energy_fn = ENERGY_FACTORIES["score_divergence"]()
+        energy_fn = ENERGY_FACTORIES["basic_fr"]()
         return driver.make_autograd_guidance_fn(y_fn, energy_fn, target_range=TARGET_RANGE, grad_clip=grad_clip)
 
     projector_fn = driver.make_lowrank_normal_projector_fn(u_fn, r_prime)
-    if method == "basic_fr":
-        energy_fn = make_knn_proj()
-    else:
-        energy_fn = make_scorediv_proj(r_prime)
+    energy_fn = make_knn_proj()
     return driver.make_projected_guidance_fn(y_fn, energy_fn, projector_fn, target_range=TARGET_RANGE, grad_clip=grad_clip)
 
 
@@ -401,8 +362,8 @@ def main():
     n_steps = config["n_steps_eval"]
     gen = torch.Generator(device=config["device"]).manual_seed(SAMPLE_SEED)
     (timesteps, alphas_cumprod, y_fn, base_step_with_t, step_scale_fn,
-     score_fn, score_at_zt_fn, sigma2_fn, d_fn, u_fn) = make_wiring(n_steps, generator=gen)
-    ENERGY_FACTORIES, make_knn_proj, make_scorediv_proj = make_energy_factories(y_fn, score_fn, sigma2_fn, d_fn)
+     score_at_zt_fn, sigma2_fn, u_fn) = make_wiring(n_steps, generator=gen)
+    ENERGY_FACTORIES, make_knn_proj = make_energy_factories(y_fn, sigma2_fn)
 
     print(f"unguided baseline ({config['n_samples']} samples, {n_steps} steps)...", flush=True)
     X_unguided = run_condition(base_step_with_t, n_steps, None, 0.0, 0.0, 1.0, step_scale_fn, gen)
@@ -411,46 +372,36 @@ def main():
     print(baseline, flush=True)
 
     rows = [baseline]
-    # score_divergence is JacNet-projected ONLY -- jacobian="none" there means either exact
-    # autograd double-backward through the whole UNet (the verified-OOM path, see
-    # score_divergence.py's module docstring) or the FD/SPSA path, which is cheap but was
-    # explicitly ruled out as a combo we want in this sweep: only the projected condition is
-    # of interest here, so skip ambient score_divergence entirely rather than spend combos on
-    # a path we won't use. basic_fr's ambient path has no such cost (no backprop through the
-    # denoiser at all -- it's a k-NN energy), so it still sweeps both.
-    JACOBIAN_NAMES_BY_METHOD = {"basic_fr": ["none", "jacnet"], "score_divergence": ["jacnet"]}
-    # basic_fr: 1 (ambient) + R' (jacnet) jacobian-conditions; score_divergence: R' (jacnet) only.
-    n_jacobian_conditions = (1 + len(R_PRIME_LIST)) + len(R_PRIME_LIST)
+    JACOBIAN_NAMES = ["none", "jacnet"]
+    n_jacobian_conditions = 1 + len(R_PRIME_LIST)
     n_combos = len(GRAD_CLIP_LIST) * len(WINDOW_LIST) * len(LAMBDA_LIST) * n_jacobian_conditions
-    print(f"sweeping ~{n_combos} combos (method x jacobian x r' x window x grad_clip x lam; "
-          f"score_divergence restricted to jacobian=jacnet only)", flush=True)
+    print(f"sweeping ~{n_combos} combos (jacobian x r' x window x grad_clip x lam)", flush=True)
 
-    for method in ENERGY_FACTORIES:
-        for jacobian_name in JACOBIAN_NAMES_BY_METHOD[method]:
-            r_primes = ["n/a"] if jacobian_name == "none" else R_PRIME_LIST
-            for r_prime in r_primes:
-                for window_str in WINDOW_LIST:
-                    progress_lo, progress_hi = (float(v) for v in window_str.split("-"))
-                    for clip_str in GRAD_CLIP_LIST:
-                        grad_clip, is_adaptive = resolve_clip_spec(clip_str, score_at_zt_fn)
-                        guidance_fn = make_guidance_fn(
-                            y_fn, ENERGY_FACTORIES, make_knn_proj, make_scorediv_proj, u_fn,
-                            score_fn, sigma2_fn, d_fn, method, jacobian_name,
-                            r_prime if r_prime != "n/a" else None, grad_clip)
-                        for lam_str in LAMBDA_LIST:
-                            lam = float(lam_str)
-                            t0 = time.time()
-                            X = run_condition(base_step_with_t, n_steps, guidance_fn,
-                                               lam, progress_lo, progress_hi, step_scale_fn, gen)
-                            row = {"method": method, "jacobian": jacobian_name, "r_prime": r_prime,
-                                   "window": window_str, "grad_clip": clip_str,
-                                   "clip_mode": "adaptive" if is_adaptive else "fixed", "lam": lam,
-                                   **evaluate(pack(X))}
-                            rows.append(row)
-                            clip_tag = clip_str.replace(":", "")
-                            tag = f"{method}_{jacobian_name}_r{r_prime}_win{window_str}_clip{clip_tag}_lam{lam_str}"
-                            print(f"{tag}: {row['mem_ratio']=:.3f} {row['fidelity_proxy']=:.4f} "
-                                  f"({time.time() - t0:.1f}s)", flush=True)
+    method = "basic_fr"
+    for jacobian_name in JACOBIAN_NAMES:
+        r_primes = ["n/a"] if jacobian_name == "none" else R_PRIME_LIST
+        for r_prime in r_primes:
+            for window_str in WINDOW_LIST:
+                progress_lo, progress_hi = (float(v) for v in window_str.split("-"))
+                for clip_str in GRAD_CLIP_LIST:
+                    grad_clip, is_adaptive = resolve_clip_spec(clip_str, score_at_zt_fn)
+                    guidance_fn = make_guidance_fn(
+                        y_fn, ENERGY_FACTORIES, make_knn_proj, u_fn, jacobian_name,
+                        r_prime if r_prime != "n/a" else None, grad_clip)
+                    for lam_str in LAMBDA_LIST:
+                        lam = float(lam_str)
+                        t0 = time.time()
+                        X = run_condition(base_step_with_t, n_steps, guidance_fn,
+                                           lam, progress_lo, progress_hi, step_scale_fn, gen)
+                        row = {"method": method, "jacobian": jacobian_name, "r_prime": r_prime,
+                               "window": window_str, "grad_clip": clip_str,
+                               "clip_mode": "adaptive" if is_adaptive else "fixed", "lam": lam,
+                               **evaluate(pack(X))}
+                        rows.append(row)
+                        clip_tag = clip_str.replace(":", "")
+                        tag = f"{method}_{jacobian_name}_r{r_prime}_win{window_str}_clip{clip_tag}_lam{lam_str}"
+                        print(f"{tag}: {row['mem_ratio']=:.3f} {row['fidelity_proxy']=:.4f} "
+                              f"({time.time() - t0:.1f}s)", flush=True)
 
     df = pd.DataFrame(rows)
     df["fidelity_rel"] = df["fidelity_proxy"] / baseline["fidelity_proxy"]
@@ -480,11 +431,8 @@ def main():
     print("\n-- r_prime -- (jacnet only) best by median:", flush=True)
     print(r_best_median.sort_values("method").to_string(index=False), flush=True)
 
-    # score_divergence is jacobian="jacnet"-only in this sweep (see the jacobian-conditions
-    # comment above main()'s loop), so there is no ("score_divergence", "none") group to plot.
     GROUP_COLORS = {
         ("basic_fr", "none"): "tab:blue", ("basic_fr", "jacnet"): "tab:green",
-        ("score_divergence", "jacnet"): "tab:red",
     }
     GROUPS = list(GROUP_COLORS.keys())
     JACNET_GROUPS = [g for g in GROUPS if g[1] == "jacnet"]

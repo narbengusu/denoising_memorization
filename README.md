@@ -1,8 +1,10 @@
 ## Goal
 
-Can a guidance signal derived from the score's own local geometry (Fisher-Rao energy /
-score-divergence, optionally restricted to an estimated tangent subspace) push samples away from
-memorized training points without distorting the rest of the distribution on a learned diffusion model?
+Can a guidance signal derived from the score's own local geometry (Fisher-Rao energy over the k
+nearest training atoms) push samples away from memorized training points without distorting the
+rest of the distribution on a learned diffusion model? The settled recipe is **ambient k-NN
+Fisher-Rao energy + adaptive softmax temperature (`q_target`) + relative trust region (`eta`)** —
+see `src/guidance/README.md` for the full API and its migration status.
 
 ## Folder structure
 
@@ -10,30 +12,20 @@ memorized training points without distorting the rest of the distribution on a l
   imports. See `src/guidance/README.md` for its API.
 - **`experiments/`** — small-scale notebooks, run locally.
   - `toy_manifold/`: a 1D curve in R^2. `01_train_score.ipynb` trains the score net;
-    `02_fr_guidance.ipynb` runs the full FR-guidance sweep (diagnostic, method × jacobian × window
-    × grad_clip × lam, per-parameter marginals).
-  - `so_n/`: SO(n) rotation matrices. `01_train_score.ipynb` trains the score net,
-    `02_train_jacnet.ipynb` trains a JacNet tangent estimator, `03_fr_guidance.ipynb` runs the same
-    sweep shape as `toy_manifold`, projected via the trained JacNet instead of an analytic tangent.
+    `02_fr_guidance.ipynb` runs the settled recipe's projected-vs-unprojected jacobian comparison
+    (`basic_fr` only, relative trust region `eta`, no Bayesian variants); `04_bayesian_fr_1d_slice.ipynb`
+    and `05_bayesian_regime_comparison.ipynb` are active research notebooks for the Bayesian
+    posterior variants (`bayesian_fr.py`/`bayesian_fr_v2.py`) that `02` no longer covers.
+  - `cifar10/`: FR-guidance on the finetuned CIFAR-10 DDPM, mirroring `toy_manifold/02` at image
+    scale — `01_generate_memorized_sample.ipynb` picks a memorized seed, `02_fr_guidance.ipynb` runs
+    the guided sweep (`q_target` × `eta` × guidance window).
 - **`cluster-codes/`** — the same pipeline at real-model scale, as Slurm-submitted scripts rather
   than notebooks (`submit_*.sh`, one per `*.py`).
   - `qm9/`: molecule generation (EGNN).
   - `cifar10/`: image generation (`google/ddpm-cifar10-32`, finetuned to memorize a small subset).
-    Order: `submit_cifar10_finetune.sh` → `submit_cifar10_train_jacnet.sh` (low-rank JacNet, see its
-    module docstring for why low-rank at image scale) → `submit_cifar10_fr_guidance.sh` (unified
-    sweep) → `assess_memorization_cifar10.py` for real FID on a chosen result.
-- **`preliminary/`** — earlier, superseded exploratory notebooks. Kept for reference (e.g. the
-  Dirichlet-bootstrap derivation `src/guidance/bayesian_fr.py` still needs porting from), not
-  maintained currently.
+    `sample_cifar10_fr.py` is the basic ambient FR sweep; `sample_cifar10_fr_guidance.py` adds the
+    JacNet-projected comparison. Several scripts here still target the pre-cleanup `driver.py` API
+    (`lam`/`step_scale_fn`/`grad_clip`, plus JacNet training) - to be fixed. 
 - **`checkpoints/`, `data/`, `figures/`, `cluster-codes/*/pretrained/`** — generated artifacts
   (model weights, datasets, plots). Gitignored; regenerate by running the corresponding
   notebook/script.
-
-## Getting started
-
-1. Train a score net: `experiments/so_n/01_train_score.ipynb` or
-   `experiments/toy_manifold/01_train_score.ipynb` (small, local) — or `cluster-codes/*/submit_*train*.sh`
-   (cluster-scale).
-2. If you want tangent-projected guidance, train JacNet next (`experiments/so_n/02_train_jacnet.ipynb`
-   or `cluster-codes/*/submit_*_train_jacnet.sh`).
-3. Run the FR-guidance sweep (`*_fr_guidance.ipynb` / `submit_*_fr_guidance.sh`).

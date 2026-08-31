@@ -1,58 +1,22 @@
 """Guided diffusion sampling driver -- model- and energy-method-agnostic.
 
-Implements the shared control flow behind all FR-guided sampling algorithm
-variants (basic_fr's k-NN Fisher-Rao energy, bayesian_fr's Dirichlet-bootstrap
-posterior variant, and score_divergence's empirical score-divergence energy):
-a base reverse step, spliced with a guidance correction at every `ell`-th step
-inside a t* window, gated by an optional target range on the guidance energy
-I(y), and optionally projected onto an estimated tangent subspace via
-`jacobian_fn` (see eig_tangent_projector / make_jacobian_fn below).
+Implements the shared control flow behind the FR-guided sampling algorithm
+(basic_fr's k-NN Fisher-Rao energy, and bayesian_fr's Dirichlet-bootstrap
+posterior variant): a base reverse step, spliced with a guidance correction
+at every `ell`-th step inside a t* window, gated by an optional target range
+on the guidance energy I(y), and optionally projected onto an estimated
+tangent subspace via `jacobian_fn` (see eig_tangent_projector / make_jacobian_fn
+below).
 
 The state being diffused, the base reverse step, the denoiser, and the energy
 function are all passed in as callables operating on a single flat tensor
 `z_t` of shape [B, D] -- any model (SO(n) toy MLP, QM9 EGNN, ...) plugs in by
 writing pack/unpack + step/denoise wrappers around its own state
-representation, and one of `basic_fr.py`, `bayesian_fr.py`, or
-`score_divergence.py` supplies the energy function. Nothing here is QM9- or
-SO(n)-specific, and nothing here is specific to any one guidance method.
+representation, and one of `basic_fr.py` or `bayesian_fr.py` supplies the
+energy function. Nothing here is QM9- or SO(n)-specific, and nothing here is
+specific to any one guidance method.
 """
 import torch
-
-
-def _clip_grad_norm(g, clip_norm, eps=1e-8):
-    """Cap each row's norm at clip_norm; leave sub-threshold rows unchanged.
-
-    I(y) is unbounded for both guidance energies here (unlike a bounded field
-    like a Voronoi margin), so the raw gradient can spike by orders of
-    magnitude near a genuine cluster boundary or a sharp score singularity --
-    left unclipped this reliably diverges the sampler (verified empirically: a
-    single spike at one guidance step sends x to NaN within a couple of
-    subsequent steps). A soft cap preserves direction and small-gradient
-    behavior away from interfaces while preventing blowup.
-
-    clip_norm may be a python scalar (fixed cap, broadcasts to every row) or
-    a per-row tensor of shape [B] or [B, 1] (e.g. an adaptive, x/t-dependent
-    cap from _resolve_clip_norm below) -- both divide elementwise into gn."""
-    if clip_norm is None:
-        return g
-    gn = g.norm(dim=-1, keepdim=True).clamp(min=eps)
-    if torch.is_tensor(clip_norm):
-        clip_norm = clip_norm.reshape(gn.shape)
-    scale = (clip_norm / gn).clamp(max=1.0)
-    return g * scale
-
-
-def _resolve_clip_norm(grad_clip, z_t):
-    """grad_clip is either None, a fixed scalar, or a callable adaptive_clip_fn(z_t)
-    -> per-row cap [B] or [B, 1] -- e.g. ||score(z_t, t)|| at the current (x, t),
-    so the guidance correction is never allowed to outweigh the model's own drift
-    at that point rather than being bounded by one hand-picked constant for every
-    x and every t. Callable is evaluated under no_grad -- the cap itself is just a
-    magnitude, not something to backprop through."""
-    if not callable(grad_clip):
-        return grad_clip
-    with torch.no_grad():
-        return grad_clip(z_t)
 
 
 def gate_in_range(I, target_range):
@@ -64,16 +28,24 @@ def gate_in_range(I, target_range):
     return (I >= lo) & (I <= hi)
 
 
-def guidance_grad(y_fn, z_t, energy_fn, target_range=None, grad_clip=None):
+def guidance_grad(y_fn, z_t, energy_fn, target_range=None, denoise=True):
     """Compute grad_{z_t} I(D_t(z_t)) via EXACT autograd through y_fn (the
-    denoiser) and energy_fn (either algorithm's I(y)). If target_range=(lo,
+    denoiser) and energy_fn (the algorithm's I(y)). If target_range=(lo,
     hi) is given, guidance is zeroed out for batch elements whose I falls
     outside it (the algorithm's second gating condition); target_range=None
     applies guidance to every element whenever called (the caller still
     enforces the window/period gate).
 
-    grad_clip: None (no clipping), a fixed scalar, or a callable
-    adaptive_clip_fn(z_t) -> per-row cap [B]/[B, 1] -- see _resolve_clip_norm.
+    denoise: True (default) evaluates energy_fn at y = y_fn(z_g), the
+    denoiser's expected-endpoint estimate D_t(z_t) -- this is the algorithm
+    as designed. False skips the denoiser entirely and evaluates energy_fn
+    directly at z_g (the current, still-noisy point) -- an ablation to
+    isolate whether routing guidance through the expected endpoint matters,
+    vs. just reacting to I at x_t itself. Note energy_fn's own scale/meaning
+    may not be comparable between the two settings (e.g. a k-NN energy built
+    against a clean-data index sees an out-of-distribution query when handed
+    a noisy z_t) -- treat denoise=True/False as different quantities, not
+    directly comparable magnitudes.
 
     This is the AMBIENT (no manifold information) baseline -- classic
     classifier-guidance-style exact gradient of I(D_t(z_t)) w.r.t. z_t. When
@@ -86,46 +58,40 @@ def guidance_grad(y_fn, z_t, energy_fn, target_range=None, grad_clip=None):
 
     Runs under its own `torch.enable_grad()` so it works whether or not the
     surrounding sampling loop is wrapped in `torch.no_grad()` (the base steps
-    of a reverse loop typically are; this guidance step is the exception).
-    energy_fn may itself use double-backward internally (the score-divergence
-    variant's exact mode does) for that method, DOUBLE-BACKWARD THROUGH
-    THE WHOLE NETWORK is what it costs to get an exact gradient here, which
-    can OOM at large batch sizes; score_divergence.make_score_div_fd_guidance_fn
-    is a finite-difference alternative that never needs a second backward
-    graph, at the cost of a noisier gradient estimate. See its docstring."""
+    of a reverse loop typically are; this guidance step is the exception)."""
     with torch.enable_grad():
         z_g = z_t.detach().requires_grad_(True)
-        y = y_fn(z_g)
+        y = y_fn(z_g) if denoise else z_g
         I = energy_fn(y)
         in_range = gate_in_range(I, target_range)
 
         grad = torch.zeros_like(z_t)
         if torch.any(in_range):
             (g_full,) = torch.autograd.grad(I.sum(), z_g)
-            g_full = _clip_grad_norm(g_full, _resolve_clip_norm(grad_clip, z_t))
             mask = in_range.to(g_full.dtype).view(-1, *([1] * (g_full.dim() - 1)))
             grad = g_full * mask
     return grad, I.detach(), in_range
 
 
-def make_autograd_guidance_fn(y_fn, energy_fn, target_range=None, grad_clip=None):
+def make_autograd_guidance_fn(y_fn, energy_fn, target_range=None, denoise=True):
     """Adapter: wraps guidance_grad into the guidance_fn(z_t) -> (grad, I,
-    in_range) signature guided_reverse_loop expects, for guidance methods
-    that use exact autograd (as opposed to score_divergence's
-    finite-difference alternative, which builds a guidance_fn directly)."""
+    in_range) signature guided_reverse_loop expects.
+
+    denoise: see guidance_grad -- True (default) evaluates energy_fn at the
+    denoised endpoint D_t(z_t); False evaluates it directly at z_t."""
     def guidance_fn(z_t):
-        return guidance_grad(y_fn, z_t, energy_fn, target_range, grad_clip)
+        return guidance_grad(y_fn, z_t, energy_fn, target_range, denoise)
     return guidance_fn
 
 
-def projected_guidance_grad(y_fn, z_t, energy_fn, projector_fn, target_range=None, grad_clip=None,
+def projected_guidance_grad(y_fn, z_t, energy_fn, projector_fn, target_range=None,
                              denoiser_jacobian_fn=None):
     """Compute the tangent-projected guidance correction. `P` is built from a
     detached snapshot of `y` (the tangent DIRECTIONS should reflect the
     manifold/energy geometry at y, not get perturbed by whatever Jacobian
     machinery is used elsewhere) -- energy_fn(y, P) -> I [B] must itself use
     P to restrict the energy to tangent directions (e.g.
-    basic_fr.make_knn_projected_energy_fn, score_divergence.make_score_div_projected_energy_fn).
+    basic_fr.make_knn_projected_energy_fn).
 
     denoiser_jacobian_fn=None (default): grad_y I(y, P) is computed in
     y-space and used AS-IS as the z_t-space correction -- implicitly assumes
@@ -148,10 +114,6 @@ def projected_guidance_grad(y_fn, z_t, energy_fn, projector_fn, target_range=Non
     directly. This is what should actually be used; None only exists so
     callers that haven't wired up a jacobian_fn yet keep their old behavior.
 
-    grad_clip is applied to the FINAL z_t-space correction (after the
-    Jacobian mapping, if any) -- the clip should bound what actually gets
-    added to z_t, not an intermediate y-space quantity.
-
     Returns (grad [same shape as z_t], I.detach() [B], in_range [B] bool)."""
     with torch.no_grad():
         y_snapshot = y_fn(z_t)
@@ -168,18 +130,17 @@ def projected_guidance_grad(y_fn, z_t, energy_fn, projector_fn, target_range=Non
                 with torch.no_grad():
                     J = denoiser_jacobian_fn(z_t)   # [B, D, D], dy/dz_t
                 g = torch.bmm(J.transpose(-1, -2), g.unsqueeze(-1)).squeeze(-1)
-            g = _clip_grad_norm(g, _resolve_clip_norm(grad_clip, z_t))
             mask = in_range.to(g.dtype).view(-1, *([1] * (g.dim() - 1)))
             grad = g * mask
     return grad, I.detach(), in_range
 
 
-def make_projected_guidance_fn(y_fn, energy_fn, projector_fn, target_range=None, grad_clip=None,
+def make_projected_guidance_fn(y_fn, energy_fn, projector_fn, target_range=None,
                                 denoiser_jacobian_fn=None):
     """Adapter: wraps projected_guidance_grad into the guidance_fn(z_t) ->
     (grad, I, in_range) signature guided_reverse_loop expects."""
     def guidance_fn(z_t):
-        return projected_guidance_grad(y_fn, z_t, energy_fn, projector_fn, target_range, grad_clip,
+        return projected_guidance_grad(y_fn, z_t, energy_fn, projector_fn, target_range,
                                         denoiser_jacobian_fn)
     return guidance_fn
 
@@ -234,8 +195,7 @@ def make_projector_fn(jacobian_matrix_fn, k, largest=False):
     manifold-dimension ablation knob -- how many tangent directions to keep.
 
     Dense: forms a [B, D, D] matrix, fine at toy/SO(n) scale (D up to a few
-    hundred) but NOT at image scale -- see make_lowrank_normal_projector_fn
-    for the D=thousands case."""
+    hundred) but not tractable at image scale (D=thousands)."""
     def projector_fn(y):
         return eig_tangent_projector(jacobian_matrix_fn(y), k, largest=largest)
     return projector_fn
@@ -243,50 +203,17 @@ def make_projector_fn(jacobian_matrix_fn, k, largest=False):
 
 def apply_projector(P, v):
     """Applies a projector to v: [B, ..., D]. P may be either a callable
-    v -> Pv (the operator-based path -- see make_lowrank_normal_projector_fn),
-    or a dense [B, D, D] tensor (the legacy path -- eig_tangent_projector/
-    make_projector_fn). Every caller of a projector inside this package
-    (basic_fr.fisher_rao_energy, score_divergence.hutchinson_trace) goes
-    through this dispatch instead of applying P directly, so dense- and
-    operator-based projectors are interchangeable everywhere."""
+    v -> Pv, or a dense [B, D, D] tensor (the path used here --
+    eig_tangent_projector/make_projector_fn). Every caller of a projector
+    inside this package (basic_fr.fisher_rao_energy) goes through this
+    dispatch instead of applying P directly, so dense- and operator-based
+    projectors are interchangeable everywhere."""
     if callable(P):
         return P(v)
     orig_shape = v.shape
     v_flat = v.reshape(v.shape[0], -1, v.shape[-1])
     out = torch.bmm(v_flat, P.transpose(-1, -2))   # P symmetric, so this == bmm(P, v)
     return out.reshape(orig_shape)
-
-
-def make_lowrank_normal_projector_fn(u_fn, r_prime):
-    """u_fn(y) -> U [B, D, R]: a per-sample low-rank factor (e.g. a trained
-    low-rank JacNet's output) such that M ~ U U^T approximates the rescaled
-    score Jacobian restricted to its R dominant (highest-|eigenvalue|,
-    "normal"/high-curvature) directions -- the only structure a low-rank M
-    can represent, unlike eig_tangent_projector's dense path, which can
-    resolve genuine near-zero-eigenvalue ("tangent") directions directly.
-
-    Consequently this returns the ORTHOGONAL-COMPLEMENT projector -- remove
-    JacNet's top-r' identified normal directions rather than keep a small-k
-    tangent subset (which would be numerically arbitrary here: with M
-    rank-R, the "smallest-eigenvalue" space is a massively degenerate
-    (D-R)-dim null space with no preferred orientation to select k of).
-
-    Q_r' = U's top-r' left-singular vectors, found via one [B, D, R]
-    economy SVD (R small, e.g. 8) -- never forms a dense [B, D, D] matrix.
-    Returns projector_fn(y) -> callable v -> v - Q_r'(Q_r'^T v)."""
-    def projector_fn(y):
-        U = u_fn(y)
-        Q, _, _ = torch.linalg.svd(U, full_matrices=False)   # Q: [B, D, R], descending singular value
-        Qr = Q[:, :, :r_prime]
-
-        def apply(v):
-            orig_shape = v.shape
-            v_flat = v.reshape(v.shape[0], -1, v.shape[-1])
-            coeff = torch.bmm(v_flat, Qr)
-            proj_component = torch.bmm(coeff, Qr.transpose(-1, -2))
-            return (v_flat - proj_component).reshape(orig_shape)
-        return apply
-    return projector_fn
 
 
 def guidance_window(step_idx, n_steps, progress_lo, progress_hi, ell):
@@ -309,23 +236,58 @@ def guidance_window(step_idx, n_steps, progress_lo, progress_hi, ell):
     return step_idx % ell == 0
 
 
+def _resolve_eta(eta, step_idx):
+    """eta is either a fixed scalar (fine as-is) or a callable eta_fn(step_idx)
+    -> float/tensor -- e.g. a beta(t) or beta(t)^-1 schedule, for trying a
+    functional guidance-strength profile instead of one constant for the whole
+    trajectory. Evaluated under no_grad since it's a magnitude, not something
+    to backprop through."""
+    if not callable(eta):
+        return eta
+    with torch.no_grad():
+        return eta(step_idx)
+
+
+def guidance_correction(grad, z, z_next, trust_region, step_idx, eps=1e-8):
+    """Turn a raw guidance gradient into the correction actually added to
+    z_next: eta * ||z_next - z|| * grad/||grad||. eta (trust_region: a float
+    or a callable eta_fn(step_idx)) is dimensionless -- "move this fraction of
+    what the base sampler itself moves this step" -- so it is invariant to t,
+    to sigma, and to gradient spikes. NOT invariant to ambient dimension or to
+    the dataset: the toy manifold (d=2) needs eta=1.0 where CIFAR-10
+    (D=3072) needs eta=0.1 -- calibrate once per dataset on a geometric
+    ladder, then freeze it. Two attempts to derive it from first principles
+    (a cumulative-displacement budget; matching the sampler's own
+    deterministic drift) both underestimated the toy manifold's working value
+    by 40-800x, because eta behaves like a threshold, not a scale match.
+
+    The ||grad|| > eps guard is load-bearing, not defensive boilerplate:
+    fisher_rao_energy has genuine dead zones where Var_q(g) -- and hence grad
+    -- is EXACTLY zero (one-hot q collapse; see its docstring). Normalizing
+    there would turn float noise into a full-magnitude step in an arbitrary
+    direction, which looks exactly like the off-manifold collapse failure mode
+    and would be easy to misattribute to eta being too large."""
+    eta = _resolve_eta(trust_region, step_idx)
+    gn = grad.norm(dim=-1, keepdim=True)
+    base = (z_next - z).norm(dim=-1, keepdim=True)
+    corr = eta * base * grad / gn.clamp(min=eps)
+    return torch.where(gn > eps, corr, torch.zeros_like(grad))
+
+
 def guided_reverse_loop(z_init, n_steps, base_step_fn, guidance_fn,
-                         progress_lo, progress_hi, ell, lam, step_scale_fn,
+                         progress_lo, progress_hi, ell, trust_region,
                          measure_fn=None, measure_steps=None, hist_out=None):
     """Run the full T..1 reverse loop with guidance spliced in -- shared by
-    both algorithms; only `guidance_fn` differs between them (and between the
-    exact-autograd and finite-difference variants of the same algorithm).
+    both algorithms; only `guidance_fn` differs between them.
 
     base_step_fn(z_t, step_idx) -> z_{t-1}       (the model's own unguided reverse step)
     guidance_fn(z_t) -> (grad, I [B], in_range [B])   built by
-        driver.make_autograd_guidance_fn(...) or
-        score_divergence.make_score_div_fd_guidance_fn(...) (or the basic_fr /
-        exact score-divergence equivalents) -- already closes over y_fn,
-        energy_fn, target_range, grad_clip, and jacobian_fn, so it only ever
-        takes z_t.
-    step_scale_fn(step_idx) -> float or tensor   (the algorithm's a_t(x_t) term
-                                                scaling the guidance correction;
-                                                pass a schedule, e.g. sigma_t^2)
+        driver.make_autograd_guidance_fn(...) or make_projected_guidance_fn(...)
+        -- already closes over y_fn, energy_fn, and target_range, so it only
+        ever takes z_t.
+    trust_region: float or a callable eta_fn(step_idx) -- the relative
+        parameterization, eta * ||base step|| * grad/||grad||. See
+        guidance_correction.
     progress_lo, progress_hi: see guidance_window -- fractions of the sampling
                 loop elapsed, NOT the schedule's t (progress_hi=1.0 guides
                 through the very end of sampling; progress_lo=0.0 guides from
@@ -352,7 +314,7 @@ def guided_reverse_loop(z_init, n_steps, base_step_fn, guidance_fn,
         if guidance_window(step_idx, n_steps, progress_lo, progress_hi, ell):
             grad, I, in_range = guidance_fn(z)
             if torch.any(in_range):
-                z_next = z_next + lam * step_scale_fn(step_idx) * grad
+                z_next = z_next + guidance_correction(grad, z, z_next, trust_region, step_idx)
             I_log.append((step_idx, I.mean().item(), int(in_range.sum().item())))
         z = z_next
     return z, I_log

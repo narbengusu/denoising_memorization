@@ -21,7 +21,8 @@ DEFAULT_B = 256
 DEFAULT_DIRICHLET_ALPHA = 1.0
 
 
-def soft_posterior_bb(y, neighbors, beta_t, B=None, dirichlet_alpha=None, return_var=False, beta_floor=None):
+def soft_posterior_bb(y, neighbors, beta_t, B=None, dirichlet_alpha=None, return_var=False, beta_floor=None,
+                       generator=None):
     """y: [B, D], neighbors: [B, k, D] (the k retrieved training points, same
     as basic_fr.fisher_rao_energy). beta_t: [B], pinned to sigma_t^2.
 
@@ -33,6 +34,11 @@ def soft_posterior_bb(y, neighbors, beta_t, B=None, dirichlet_alpha=None, return
     its temperature; the caller (fisher_rao_energy_bb) still divides by the
     TRUE, unfloored beta_t^2 for the outer scale. None reproduces the
     original, undecoupled behavior.
+
+    generator: optional torch.Generator for the Dirichlet bootstrap draw --
+    without it, the draw consumes the global RNG, so results vary run to run
+    even with a fixed z_init. Pass the same generator used to seed sampling
+    for reproducibility.
 
     Returns (q_mean [B, k], g [B, k, D]) -- g is the same neighbor-difference
     tensor basic_fr.fisher_rao_energy computes, so fisher_rao_energy_bb can
@@ -48,9 +54,15 @@ def soft_posterior_bb(y, neighbors, beta_t, B=None, dirichlet_alpha=None, return
     g = y.unsqueeze(1) - neighbors                      # [Bq, k, D]
     E = 0.5 * (g ** 2).sum(-1)                            # [Bq, k]
 
-    dirichlet = torch.distributions.Dirichlet(
-        torch.full((k,), dirichlet_alpha, device=y.device, dtype=y.dtype))
-    p = dirichlet.sample((B,))                            # [B, k]
+    concentration = torch.full((k,), dirichlet_alpha, device=y.device, dtype=y.dtype)
+    if generator is None:
+        p = torch.distributions.Dirichlet(concentration).sample((B,))  # [B, k]
+    else:
+        # torch.distributions.Dirichlet.sample has no generator= hook, so draw
+        # the underlying Gamma variates directly (same reparameterization it
+        # uses internally) against the given generator, then normalize.
+        gamma = torch._standard_gamma(concentration.expand(B, k), generator=generator)
+        p = gamma / gamma.sum(-1, keepdim=True)          # [B, k]
     logp = torch.log(p.clamp_min(1e-12))                  # [B, k]
     logits = logp.unsqueeze(0) - E.unsqueeze(1) / beta_soft_col.unsqueeze(-1)  # [Bq, B, k]
     q_b = F.softmax(logits, dim=-1)                       # [Bq, B, k]
@@ -62,47 +74,53 @@ def soft_posterior_bb(y, neighbors, beta_t, B=None, dirichlet_alpha=None, return
     return q_mean, g
 
 
-def fisher_rao_energy_bb(y, neighbors, beta_t, B=None, dirichlet_alpha=None, P=None, beta_floor=None):
+def fisher_rao_energy_bb(y, neighbors, beta_t, B=None, dirichlet_alpha=None, P=None, beta_floor=None,
+                          generator=None):
     """Bayesian counterpart of basic_fr.fisher_rao_energy: identical
     variance-of-g formula, with q replaced by the bootstrap-averaged q_bar
     from soft_posterior_bb. P: optional tangent projector, applied to g
     before anything else, same contract as basic_fr.fisher_rao_energy.
     beta_floor: see soft_posterior_bb -- only affects the posterior's
     temperature, the outer 1/beta_t^2 below always uses the true beta_t.
+    generator: see soft_posterior_bb.
     Returns (I [B], q_mean [B, k], g [B, k, D])."""
     g = y.unsqueeze(1) - neighbors
     if P is not None:
         g = apply_projector(P, g)
-    q, _ = soft_posterior_bb(y, neighbors, beta_t, B=B, dirichlet_alpha=dirichlet_alpha, beta_floor=beta_floor)
+    q, _ = soft_posterior_bb(y, neighbors, beta_t, B=B, dirichlet_alpha=dirichlet_alpha, beta_floor=beta_floor,
+                              generator=generator)
     Eq_g = (q.unsqueeze(-1) * g).sum(1)
     Eq_g2 = (q * (g ** 2).sum(-1)).sum(1)
     I = (Eq_g2 - (Eq_g ** 2).sum(-1)) / beta_t ** 2
     return I, q, g
 
 
-def make_knn_bayesian_fr_energy_fn(index, k, beta_t_fn, B=None, dirichlet_alpha=None, beta_floor=None):
+def make_knn_bayesian_fr_energy_fn(index, k, beta_t_fn, B=None, dirichlet_alpha=None, beta_floor=None,
+                                    generator=None):
     """Returns energy_fn(y) -> I [B] for driver.guidance_grad /
     guided_reverse_loop (the AMBIENT, unprojected energy) -- Bayesian
     counterpart of basic_fr.make_knn_fr_energy_fn. beta_floor: see
-    fisher_rao_energy_bb."""
+    fisher_rao_energy_bb. generator: see soft_posterior_bb -- pass the same
+    generator seeding the sampler's z_init for reproducible runs."""
     def energy_fn(y):
         with torch.no_grad():
             neighbors, _ = basic_fr.ann_query(index, y, k)
         I, _, _ = fisher_rao_energy_bb(y, neighbors, beta_t_fn(), B=B, dirichlet_alpha=dirichlet_alpha,
-                                        beta_floor=beta_floor)
+                                        beta_floor=beta_floor, generator=generator)
         return I
     return energy_fn
 
 
-def make_knn_bayesian_projected_energy_fn(index, k, beta_t_fn, B=None, dirichlet_alpha=None, beta_floor=None):
+def make_knn_bayesian_projected_energy_fn(index, k, beta_t_fn, B=None, dirichlet_alpha=None, beta_floor=None,
+                                           generator=None):
     """Returns energy_fn(y, P) -> I [B] for
     driver.projected_guidance_grad/make_projected_guidance_fn -- the tangent-
     restricted counterpart of make_knn_bayesian_fr_energy_fn. beta_floor: see
-    fisher_rao_energy_bb."""
+    fisher_rao_energy_bb. generator: see soft_posterior_bb."""
     def energy_fn(y, P):
         with torch.no_grad():
             neighbors, _ = basic_fr.ann_query(index, y, k)
         I, _, _ = fisher_rao_energy_bb(y, neighbors, beta_t_fn(), B=B, dirichlet_alpha=dirichlet_alpha, P=P,
-                                        beta_floor=beta_floor)
+                                        beta_floor=beta_floor, generator=generator)
         return I
     return energy_fn
