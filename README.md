@@ -1,31 +1,43 @@
-## Goal
 
-Can a guidance signal derived from the score's own local geometry (Fisher-Rao energy over the k
-nearest training atoms) push samples away from memorized training points without distorting the
-rest of the distribution on a learned diffusion model? The settled recipe is **ambient k-NN
-Fisher-Rao energy + adaptive softmax temperature (`q_target`) + relative trust region (`eta`)** —
-see `src/guidance/README.md` for the full API and its migration status.
+## Structure
 
-## Folder structure
+```
+src/guidance/         shared guided-sampling library, used by every experiment
+experiments/           one folder per dataset: download, finetune, sample, guide
+  sinusoid/               1-D curve in R^2, no external data
+  cifar10/                 finetuned pixel-space DDPM
+  celeba_hq/                finetuned latent-space EDM
+workshop_figures/      one generator per paper figure, rendered output in out/
+data/                  downloaded datasets (gitignored)
+checkpoints/, pretrained/, trained_data/
+                        model weights and run artifacts (gitignored, regenerable)
+preliminary/           exploratory work not reported in the paper, not maintained
+```
 
-- **`src/guidance/`** — the shared, model-agnostic guided-sampling library every experiment below
-  imports. See `src/guidance/README.md` for its API.
-- **`experiments/`** — small-scale notebooks, run locally.
-  - `toy_manifold/`: a 1D curve in R^2. `01_train_score.ipynb` trains the score net;
-    `02_fr_guidance.ipynb` runs the settled recipe's projected-vs-unprojected jacobian comparison
-    (`basic_fr` only, relative trust region `eta`, no Bayesian variants); `04_bayesian_fr_1d_slice.ipynb`
-    and `05_bayesian_regime_comparison.ipynb` are active research notebooks for the Bayesian
-    posterior variants (`bayesian_fr.py`/`bayesian_fr_v2.py`) that `02` no longer covers.
-  - `cifar10/`: FR-guidance on the finetuned CIFAR-10 DDPM, mirroring `toy_manifold/02` at image
-    scale — `01_generate_memorized_sample.ipynb` picks a memorized seed, `02_fr_guidance.ipynb` runs
-    the guided sweep (`q_target` × `eta` × guidance window).
-- **`cluster-codes/`** — the same pipeline at real-model scale, as Slurm-submitted scripts rather
-  than notebooks (`submit_*.sh`, one per `*.py`).
-  - `qm9/`: molecule generation (EGNN).
-  - `cifar10/`: image generation (`google/ddpm-cifar10-32`, finetuned to memorize a small subset).
-    `sample_cifar10_fr.py` is the basic ambient FR sweep; `sample_cifar10_fr_guidance.py` adds the
-    JacNet-projected comparison. Several scripts here still target the pre-cleanup `driver.py` API
-    (`lam`/`step_scale_fn`/`grad_clip`, plus JacNet training) - to be fixed. 
-- **`checkpoints/`, `data/`, `figures/`, `cluster-codes/*/pretrained/`** — generated artifacts
-  (model weights, datasets, plots). Gitignored; regenerate by running the corresponding
-  notebook/script.
+## Replication guide
+
+```
+pip install -r requirements.txt
+```
+
+**Sinusoid**: no download needed. Run `experiments/sinusoid/01_train_score.ipynb`
+through `03_fisher_rao_geometry.ipynb` in order.
+
+**CIFAR-10**:
+1. `python experiments/cifar10/download_model.py` (fetches `google/ddpm-cifar10-32`)
+2. `python experiments/cifar10/finetune_cifar10_ddpm.py` (CIFAR-10 itself downloads
+   automatically on first import; finetunes on a 1000-image subset until it memorizes)
+3. `01_generate_memorized_sample.ipynb` then `02_fr_guidance.ipynb`
+
+**CelebA-HQ**:
+1. `python experiments/celeba_hq/download_vae.py` (fetches `stabilityai/sd-vae-ft-mse`)
+2. Place the 30k CelebA-HQ `.jpg` files at `data/celeba_hq/images/` (no scriptable download,
+   see `celeba_hq_data.py`)
+3. `python experiments/celeba_hq/precompute_latents.py`
+4. `python experiments/celeba_hq/finetune_celeba_hq_edm.py` (finetunes on a 200-latent subset)
+5. `01_sample_celeba_hq.ipynb` then `02_fr_guidance.ipynb`
+
+**Figures**: once an experiment's checkpoints exist, run the numbered generators in
+`workshop_figures/generate/`. See `workshop_figures/README.md`.
+
+`DEVICE` (env var, default `cpu`) selects `cpu`/`mps`/`cuda` throughout.

@@ -4,9 +4,10 @@ __pycache__/
 .ipynb_checkpoints/
 data/
 CLAUDE.md
+MISSING_FROM_CLUSTER.md
 
 # large / generated directories (any depth -- covers experiments/*/checkpoints,
-# cluster-codes/*/pretrained, etc. too)
+# experiments/*/pretrained, etc. too)
 preliminary/
 figures/
 checkpoints/
@@ -18,3 +19,13 @@ trained_data/
 
 # generated plots (checkpoints/ already covers most, but stray root-level ones too)
 *.png
+
+# workshop paper figures: the generators AND their rendered output are
+# deliverables, so they override the blanket *.png / checkpoints rules above.
+!workshop_figures/
+!workshop_figures/**
+# ...except the per-run sample caches and compiled bytecode, regenerable / can be large.
+workshop_figures/cache/
+workshop_figures/**/__pycache__/
+workshop_figures/**/*.pyc
+.DS_Store

@@ -96,7 +96,7 @@ def projected_guidance_grad(y_fn, z_t, energy_fn, projector_fn, target_range=Non
     denoiser_jacobian_fn=None (default): grad_y I(y, P) is computed in
     y-space and used AS-IS as the z_t-space correction -- implicitly assumes
     dy/dz_t = identity. Cheap (no Jacobian of any kind needed). But verified
-    empirically (toy_manifold debugging session) that the denoiser is
+    empirically (sinusoid debugging session) that the denoiser is
     strongly non-identity at high t, and this default can point the
     correction in the WRONG direction for the majority of samples during the
     noisiest ~20% of a reverse trajectory (median cosine similarity to the
