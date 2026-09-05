@@ -129,8 +129,7 @@ def trace(seed, net, sigma_data, train_index):
     gen = torch.Generator(device=device if device != "mps" else "cpu").manual_seed(seed)
     z = pack(torch.randn(1, 4, 32, 32, generator=gen).to(device) * sigmas[0])
 
-    rec = {key: [] for key in ("I", "I_temp", "q_max", "q_max_temp", "gn_raw", "gn_temp",
-                                "ratio", "step_norm", "beta_soft", "sigma")}
+    rec = {key: [] for key in ("I", "q_max", "gn_raw", "ratio", "step_norm", "beta_soft", "sigma")}
     for step_idx in range(1, N_STEPS + 1):
         y_fn.s = sigmas[step_idx - 1]
         with torch.no_grad():
@@ -138,19 +137,14 @@ def trace(seed, net, sigma_data, train_index):
             neighbors, sq_d = basic_fr.ann_query(train_index, y, config["k_neighbors"])
             I, q, _ = basic_fr.fisher_rao_energy(y, neighbors, sigma2_fn())
             bf = basic_fr.beta_soft_for(sq_d, Q_TARGET)
-            I_t, q_t, _ = basic_fr.fisher_rao_energy(y, neighbors, sigma2_fn(), beta_soft=bf)
             rec["I"].append(I.item())
-            rec["I_temp"].append(I_t.item())
             rec["beta_soft"].append(bf.item())
             rec["sigma"].append(y_fn.s.item())
             rec["q_max"].append(q.max(-1).values.item())
-            rec["q_max_temp"].append(q_t.max(-1).values.item())
             rec["ratio"].append((sq_d[0, 0] / sq_d[0, 1]).sqrt().item())
 
         g_raw, _, _ = driver.guidance_grad(y_fn, z, energy_fn_for(None))
-        g_temp, _, _ = driver.guidance_grad(y_fn, z, energy_fn_for(Q_TARGET))
         rec["gn_raw"].append(g_raw.norm().item())
-        rec["gn_temp"].append(g_temp.norm().item())
 
         with torch.no_grad():
             z_next = base_step(z, step_idx)
@@ -184,7 +178,6 @@ def render(traces):
     # log-axis floors: a curve flat at the floor means the underlying value is exactly zero (dead zone)
     I_FLOOR = 1e-8
     GRAD_FLOOR = 1e-18
-    DASH = (0, (2.2, 1.8))
     WINDOW_ALPHA = 0.16
 
     HEADERS = ["FR energy", "responsibility", "gradient norm", "NN ratio"]
@@ -205,11 +198,8 @@ def render(traces):
     for t, c in zip(traces, palette):
         p = t["progress"]
         ax[0].plot(p, np.maximum(np.abs(t["I"]), I_FLOOR), lw=2.4, color=c)
-        ax[0].plot(p, np.maximum(np.abs(t["I_temp"]), I_FLOOR), lw=2.4, color=c, ls=DASH)
         ax[1].plot(p, t["q_max"], lw=2.4, color=c)
-        ax[1].plot(p, t["q_max_temp"], lw=2.4, color=c, ls=DASH)
         ax[2].plot(p, np.maximum(t["gn_raw"], GRAD_FLOOR), lw=2.4, color=c)
-        ax[2].plot(p, np.maximum(t["gn_temp"], GRAD_FLOOR), lw=2.4, color=c, ls=DASH)
         ax[3].plot(p, t["ratio"], lw=2.4, color=c)
 
     ax[0].set_yscale("log")
@@ -237,9 +227,7 @@ def render(traces):
         wsstyle.separator(fig, x, y_bottom, max(rule_ys), color="#C4C4C4")
 
     entries = [(f"seed {t['seed']}", "line", c) for t, c in zip(traces, palette)]
-    entries += [(r"$\beta_t = \sigma_t^2$", "line", "#3A3A3A"),
-                (rf"$\beta_t$ at $q^\star = {Q_TARGET:g}$", "line", "#3A3A3A", DASH),
-                ("proposed guidance window", "patch",
+    entries += [("proposed guidance window", "patch",
                  wsstyle.blend_on_white(wsstyle.C["field"], WINDOW_ALPHA))]
     wsstyle.figure_legend(fig, entries, ncol=len(entries), y=0.140, loc="upper center")
 

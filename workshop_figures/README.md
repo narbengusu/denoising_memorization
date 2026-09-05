@@ -11,18 +11,6 @@ workshop_figures/
   cache/          per-run sample caches (*.pt), regenerable, gitignored
 ```
 
-## House rules
-
-Enforced by `wsstyle.py`, not by discipline:
-
-- Times New Roman, STIX mathtext.
-- No hyperparameters drawn in the figure. Panel titles name only the swept variable; each
-  generator prints its settings and outcome numbers for the caption.
-- No shaded backgrounds. Groups separated by whitespace and a light rule grid.
-- One legend, outside every axes.
-- Shared limits across a grid, so side-by-side panels are comparable.
-- PDF is the deliverable, PNG is for quick viewing.
-
 ## Generators
 
 | Generator | Produces | Manuscript figure | Notes |
