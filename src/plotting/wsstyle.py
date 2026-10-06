@@ -178,7 +178,7 @@ ALL_FIGURES = __import__("pathlib").Path(__file__).resolve().parents[2] / "all_f
 
 
 def save(fig, name, out_dir=None, formats=("pdf",)):
-    """Write the figure to all_figures/ (uploaded to Overleaf); returns the paths written."""
+    """Write the figure to all_figures/ (uploaded to Overleaf); returns the paths written, relative to the repo root."""
     import os
     if out_dir is None:
         out_dir = ALL_FIGURES
@@ -187,7 +187,7 @@ def save(fig, name, out_dir=None, formats=("pdf",)):
     for fmt in formats:
         p = os.path.join(out_dir, f"{name}.{fmt}")
         fig.savefig(p, format=fmt)
-        paths.append(p)
+        paths.append(os.path.relpath(p, ALL_FIGURES.parent))
     return paths
 
 
