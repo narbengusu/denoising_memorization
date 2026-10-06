@@ -97,19 +97,16 @@ def render(traces):
     fig, ax = plt.subplots(1, 4, figsize=(wsstyle.FULL_WIDTH, 4.9))
     fig.subplots_adjust(left=0.06, right=0.99, top=0.96, bottom=0.36, wspace=0.42)
 
-    # EDM time t = sigma, decreasing along sampling: log axis, reversed so sampling runs left to right
-    t0 = traces[0]
-    window_t = t0["sigma"][(t0["progress"] >= WINDOW[0]) & (t0["progress"] <= WINDOW[1])]
+    # x axis is sampling progress in [0, 1], the same coordinate the guidance window is defined in
     for a in ax:
-        a.axvspan(window_t.min(), window_t.max(), color=wsstyle.C["field"], alpha=WINDOW_ALPHA, lw=0, zorder=0)
-        a.set_xscale("log")
-        a.set_xlim(t0["sigma"].max(), t0["sigma"].min())
-        a.set_xticks([10, 1, 0.1, 0.01])
-        a.set_xlabel(r"$t$")
+        a.axvspan(WINDOW[0], WINDOW[1], color=wsstyle.C["field"], alpha=WINDOW_ALPHA, lw=0, zorder=0)
+        a.set_xlim(0, 1)
+        a.set_xticks([0, 0.5, 1])
+        a.set_xlabel("sampling progress")
         wsstyle.grid_on(a)
 
     for t, c in zip(traces, palette):
-        s = t["sigma"]
+        s = t["progress"]
         ax[0].plot(s, np.maximum(np.abs(t["I"]), I_FLOOR), lw=2.4, color=c)
         ax[1].plot(s, t["q_max"], lw=2.4, color=c)
         ax[2].plot(s, np.maximum(t["gn_raw"], GRAD_FLOOR), lw=2.4, color=c)
