@@ -2,30 +2,28 @@
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
-data/
+.DS_Store
+/data/
 CLAUDE.md
 MISSING_FROM_CLUSTER.md
 
-# large / generated directories (any depth -- covers experiments/*/checkpoints,
-# experiments/*/pretrained, etc. too)
+# archive of exploratory and superseded work, not maintained
 preliminary/
-figures/
+
+# model weights and downloads (any depth: experiments/*/checkpoints, experiments/*/pretrained)
 checkpoints/
 pretrained/
 trained_data/
 
+# run caches and CSV outputs of the experiments: regenerable
+experiments/*/cache/
+experiments/*/results/
+
+# OpenAI's improved-diffusion, cloned unmodified by src/models/iddpm.py
+external/
+
 # cluster job scripts -- contain personal info (usernames, paths, etc.)
 *.sh
 
-# generated plots (checkpoints/ already covers most, but stray root-level ones too)
+# figures are written only to all_figures/ (PDF, tracked)
 *.png
-
-# workshop paper figures: the generators AND their rendered output are
-# deliverables, so they override the blanket *.png / checkpoints rules above.
-!workshop_figures/
-!workshop_figures/**
-# ...except the per-run sample caches and compiled bytecode, regenerable / can be large.
-workshop_figures/cache/
-workshop_figures/**/__pycache__/
-workshop_figures/**/*.pyc
-.DS_Store
