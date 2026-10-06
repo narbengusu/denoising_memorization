@@ -20,13 +20,11 @@ pip install -r requirements.txt
 
 Run each experiment's steps in order. Experiments are independent of each other.
 
-| Experiment | Main cost |
-|---|---|
-| [`sinusoid`](experiments/sinusoid/README.md) | ~20 min (CPU) |
-| [`cifar10_openai`](experiments/cifar10_openai/README.md) | ~45 min (MPS) |
-| [`celeba_hq`](experiments/celeba_hq/README.md) | training: days (GPU); benchmark: ~40 min (MPS) |
+- [`sinusoid`](experiments/sinusoid/README.md)
+- [`cifar10_openai`](experiments/cifar10_openai/README.md)
+- [`celeba_hq`](experiments/celeba_hq/README.md)
 
-`python supplementary_figures/finite_sample_resolution.py` and `python supplementary_figures/fisher_rao_field.py` take seconds each.
+The supplementary figures are produced by `python supplementary_figures/finite_sample_resolution.py` and `python supplementary_figures/fisher_rao_field.py`.
 
 `DEVICE` selects `cpu`, `mps` or `cuda` (default: whichever GPU is available). Each seed has its own random streams, so results do not depend on device or batch size, up to floating-point rounding.
 
